@@ -71,6 +71,18 @@ CREATE TABLE IF NOT EXISTS threshold_versions (
     UNIQUE (station_id, effective_at)  -- 同站生效时刻唯一（含不同时区表示的同一时刻）
 );
 
+-- 设备接管（汛期一站多设备轮值）：自生效时刻（含同刻）起，
+-- 仅最近一条接管记录指定设备的有效读数进入本站裁定；首条接管前沿用全部设备读数。
+CREATE TABLE IF NOT EXISTS device_takeovers (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id   INTEGER NOT NULL REFERENCES stations(id),
+    device_id    INTEGER NOT NULL REFERENCES devices(id),
+    effective_at TEXT NOT NULL,   -- 生效时刻（UTC ISO8601），含同刻起生效
+    reason       TEXT NOT NULL,   -- 接管原因（非空）
+    created_at   TEXT NOT NULL,
+    UNIQUE (station_id, effective_at)  -- 同站同一生效瞬间只允许一条记录
+);
+
 CREATE TABLE IF NOT EXISTS publications (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     published_at TEXT NOT NULL,

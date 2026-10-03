@@ -1846,3 +1846,284 @@ def test_check_data_version_advances(client, station, device):
     d3 = check(client)
     assert d3["data_version"] == v0 + 4
     assert d3["baseline_publication_id"] is not None
+
+
+# ---------------------------------------------------------------- 设备接管（汛期轮值）
+
+def add_device(client, station, device_no):
+    r = client.post(f"/stations/{station}/devices", json={"device_no": device_no})
+    assert r.status_code == 201, r.text
+    return device_no
+
+
+def make_takeover(client, station, device_no, minutes, reason="轮值接管"):
+    return client.post(
+        f"/stations/{station}/device-takeovers",
+        json={
+            "device_no": device_no,
+            "effective_at": iso(BASE + timedelta(minutes=minutes)),
+            "reason": reason,
+        },
+    )
+
+
+def takeovers(client, station):
+    r = client.get(f"/stations/{station}/device-takeovers")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_takeover_register_and_list_ordered(client, station, device):
+    add_device(client, station, "DEV-002")
+    r = make_takeover(client, station, "DEV-002", 60, reason="主设备检修，切换备用机")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    tk = body["takeover"]
+    assert tk["station_id"] == station
+    assert tk["device_no"] == "DEV-002"
+    assert tk["reason"] == "主设备检修，切换备用机"
+    assert tk["effective_at"] == iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z")
+    # 响应附带重算后的待发布裁定（本站尚无读数 → 正常无事件）
+    assert body["pending_adjudication"]["station_id"] == station
+    assert body["pending_adjudication"]["status"] == "normal"
+    assert body["pending_adjudication"]["events"] == []
+
+    # 乱序再登记一条更早时刻的记录，查询仍按生效时刻升序返回设备与原因
+    assert make_takeover(client, station, device, 30, reason="提前轮值").status_code == 201
+    rows = takeovers(client, station)
+    assert [x["effective_at"] for x in rows] == [
+        iso(BASE + timedelta(minutes=30)).replace("+00:00", "Z"),
+        iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z"),
+    ]
+    assert [x["device_no"] for x in rows] == [device, "DEV-002"]
+    assert [x["reason"] for x in rows] == ["提前轮值", "主设备检修，切换备用机"]
+
+
+def test_takeover_unknown_station_or_device_404(client, station, device):
+    assert make_takeover(client, 999, device, 0).status_code == 404
+    assert client.get("/stations/999/device-takeovers").status_code == 404
+    assert make_takeover(client, station, "NOPE", 0).status_code == 404
+    assert takeovers(client, station) == []  # 均未落库
+
+
+def test_takeover_cross_station_device_400(client, station, device):
+    other = client.post(
+        "/stations", json={"name": "邻站", "rise_threshold": 10.0, "clear_threshold": 8.0}
+    ).json()["id"]
+    # DEV-001 属于 station，对 other 而言是跨站设备 → 参数错误
+    r = make_takeover(client, other, device, 0)
+    assert r.status_code == 400
+    assert takeovers(client, other) == []
+
+
+def test_takeover_naive_time_and_blank_reason_400(client, station, device):
+    r = client.post(
+        f"/stations/{station}/device-takeovers",
+        json={"device_no": device, "effective_at": "2026-10-01T01:00:00", "reason": "x"},
+    )
+    assert r.status_code == 400
+    for bad_reason in ("", "   "):
+        r = client.post(
+            f"/stations/{station}/device-takeovers",
+            json={"device_no": device, "effective_at": iso(BASE), "reason": bad_reason},
+        )
+        assert r.status_code == 400, f"reason={bad_reason!r} 应被拒绝"
+    assert takeovers(client, station) == []
+
+
+def test_takeover_duplicate_instant_conflict(client, station, device):
+    add_device(client, station, "DEV-002")
+    r1 = make_takeover(client, station, device, 60)
+    assert r1.status_code == 201
+    # 同站同一生效瞬间（换 +08:00 表示同一时刻）→ 409
+    r2 = client.post(
+        f"/stations/{station}/device-takeovers",
+        json={
+            "device_no": "DEV-002",
+            "effective_at": iso((BASE + timedelta(minutes=60)).astimezone(timezone(timedelta(hours=8)))),
+            "reason": "重复时刻",
+        },
+    )
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["existing_takeover_id"] == r1.json()["takeover"]["id"]
+    # 同站不同时刻允许
+    assert make_takeover(client, station, "DEV-002", 120).status_code == 201
+    # 不同站同一生效瞬间互不影响
+    other = client.post(
+        "/stations", json={"name": "邻站", "rise_threshold": 10.0, "clear_threshold": 8.0}
+    ).json()["id"]
+    add_device(client, other, "DEV-009")
+    assert make_takeover(client, other, "DEV-009", 60).status_code == 201
+    assert len(takeovers(client, station)) == 2
+
+
+def test_takeover_selects_only_designated_device(client, station, device):
+    add_device(client, station, "DEV-002")
+    # 首条接管前：全部设备的有效读数都参与（DEV-001 两条 + DEV-002 一条 → 预警）
+    upload(client, device, 1, 0, 12.0)
+    upload(client, "DEV-002", 1, 5, 12.0)
+    upload(client, device, 2, 10, 12.0)
+    tl = timeline(client, station)
+    assert tl["status"] == "warning"
+    assert tl["readings_considered"] == 3
+
+    # 自 15 分钟起由 DEV-002 接管：此后 DEV-001 读数不再进入裁定
+    tk_id = make_takeover(client, station, "DEV-002", 15, reason="主设备通信中断").json()["takeover"]["id"]
+    # DEV-001 继续上报低水位：未入选，不触发解除（缺测不借用其他设备）
+    upload(client, device, 3, 15, 7.0)
+    upload(client, device, 4, 20, 7.0)
+    tl = timeline(client, station)
+    assert tl["status"] == "warning"
+    assert tl["readings_considered"] == 3
+    sel = {x["reading_id"]: x["selected"] for x in tl["readings"]}
+    assert sel == {1: True, 2: True, 3: True, 4: False, 5: False}
+    tk_ref = {x["reading_id"]: x["takeover_id"] for x in tl["readings"]}
+    assert tk_ref[1] is None and tk_ref[4] == tk_id
+    devs = {x["reading_id"]: x["device_no"] for x in tl["readings"]}
+    assert devs[2] == "DEV-002" and devs[4] == "DEV-001"
+
+    # DEV-002 低水位读数入选 → 解除
+    upload(client, "DEV-002", 2, 15, 7.0)
+    upload(client, "DEV-002", 3, 21, 7.0)
+    tl = timeline(client, station)
+    assert tl["status"] == "normal"
+    assert tl["events"][-1]["type"] == "cleared"
+    assert tl["readings_considered"] == 5
+    # 未入选读数仍可通过读数接口查询（含全部 7 条有效读数）
+    assert len(client.get(f"/stations/{station}/readings").json()) == 7
+
+
+def test_takeover_boundary_same_instant_applies(client, station, device):
+    add_device(client, station, "DEV-002")
+    # 接管生效时刻与读数同刻：同刻起即按接管记录选数
+    make_takeover(client, station, "DEV-002", 10, reason="同刻切换")
+    upload(client, device, 1, 0, 12.0)      # 接管前 → 入选
+    upload(client, device, 2, 5, 12.0)      # 接管前 → 入选
+    upload(client, device, 3, 10, 12.0)     # 同刻但非接管设备 → 未入选
+    tl = timeline(client, station)
+    assert tl["status"] == "normal"         # 仅 2 条入选，不达 3 条
+    assert tl["readings_considered"] == 2
+    upload(client, "DEV-002", 1, 10, 12.0)  # 同刻接管设备读数 → 入选
+    tl = timeline(client, station)
+    assert tl["readings_considered"] == 3
+    assert tl["status"] == "warning"        # 0/5/10 三条入选，首尾 10 分钟
+    assert tl["events"][0]["at"] == iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z")
+
+
+def test_takeover_latest_record_wins(client, station, device):
+    add_device(client, station, "DEV-002")
+    make_takeover(client, station, "DEV-002", 10, reason="切到备用机")
+    make_takeover(client, station, device, 20, reason="主设备恢复")
+    upload(client, device, 1, 0, 12.0)      # 首条接管前 → 入选
+    upload(client, "DEV-002", 1, 10, 12.0)  # [10,20) 由 DEV-002 → 入选
+    upload(client, "DEV-002", 2, 15, 12.0)  # [10,20) 由 DEV-002 → 入选
+    tl = timeline(client, station)
+    assert tl["status"] == "warning"        # 0/10/15 三条入选（首尾 15 分钟）
+    upload(client, "DEV-002", 3, 25, 7.0)   # 20 起回到 DEV-001 → 未入选
+    upload(client, "DEV-002", 4, 30, 7.0)   # 未入选
+    tl = timeline(client, station)
+    assert tl["status"] == "warning"        # 不借用 DEV-002 的低水位
+    upload(client, device, 2, 25, 7.0)      # 入选
+    upload(client, device, 3, 31, 7.0)      # 入选 → 解除
+    tl = timeline(client, station)
+    assert tl["status"] == "normal"
+    assert [e["type"] for e in tl["events"]] == ["warning", "cleared"]
+
+
+def test_takeover_retroactive_recomputes_station_and_zone(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    assert zone_timeline(client, 1)["status"] == "warning"
+    # 甲站登记第二台设备并追溯接管（生效时刻早于现有读数）→ 甲站历史读数全部未入选
+    add_device(client, s1, "D1B")
+    r = make_takeover(client, s1, "D1B", 0, reason="追溯：读数实际来自备用机")
+    assert r.status_code == 201
+    assert r.json()["pending_adjudication"]["status"] == "normal"
+    tl = timeline(client, s1)
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+    assert tl["readings_considered"] == 0
+    # 所属责任区同步按观测时间重算：预警站数跌破 K，区域事件不再成立
+    z = zone_timeline(client, 1)
+    assert z["status"] == "normal"
+    assert z["events"] == []
+    statuses = {m["station_id"]: m["warning"] for m in z["members"]}
+    assert statuses == {s1: False, s2: True}
+
+
+def test_takeover_void_correct_backfill_recompute(client, station, device):
+    add_device(client, station, "DEV-002")
+    make_takeover(client, station, "DEV-002", 0, reason="备用机全程接管")
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, "DEV-002", i, m, 12.0)
+    assert timeline(client, station)["status"] == "warning"
+    # 作废入选读数 → 重算后预警不成立
+    r = client.post("/readings/2/void", json={"reason": "误报"})
+    assert r.json()["pending_adjudication"]["status"] == "normal"
+    # 补传入选设备读数 → 重新预警
+    upload(client, "DEV-002", 4, 15, 12.0)
+    upload(client, "DEV-002", 5, 20, 12.0)
+    assert timeline(client, station)["status"] == "warning"
+    # 更正未入选设备读数的观测时间：不影响本站裁定
+    upload(client, device, 1, 25, 12.0)  # DEV-001 未入选
+    r = client.post(
+        "/readings/6/correct",
+        json={"observed_at": iso(BASE + timedelta(minutes=26)), "reason": "时钟偏移"},
+    )
+    assert r.status_code == 200
+    assert r.json()["pending_adjudication"]["status"] == "warning"
+    tl = timeline(client, station)
+    assert tl["readings_considered"] == 4  # 读数 1/3/4/5（DEV-002 有效入选）
+
+
+def test_takeover_registration_invalidates_publish_token(client, station, device):
+    add_device(client, station, "DEV-002")  # 设备登记先于核对，隔离变量
+    _make_warning(client, device)
+    token = check(client)["token"]
+    r = make_takeover(client, station, "DEV-002", 60, reason="轮值")
+    assert r.status_code == 201
+    r2 = confirm(client, token)
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "data_changed_after_check"
+    assert client.get("/publications").json() == []  # 未生成发布记录
+    # 重新核对后可正常受控发布
+    d2 = check(client)
+    assert confirm(client, d2["token"]).status_code == 201
+
+
+def test_takeover_public_unchanged_until_republish(client, station, device):
+    _make_warning(client, device)
+    r = client.post("/publish", json={"note": "接管前"})
+    pub_id = r.json()["publication_id"]
+    add_device(client, station, "DEV-002")
+    # 追溯接管使待发布预警消失，但公开结果仍冻结为预警
+    make_takeover(client, station, "DEV-002", 0, reason="追溯接管")
+    assert timeline(client, station)["status"] == "normal"
+    assert client.get("/public/current").json()["timelines"][0]["status"] == "warning"
+    assert client.get(f"/public/stations/{station}/timeline").json()["status"] == "warning"
+    # 重新发布才更新公开结果，历史快照不改写
+    client.post("/publish", json={"note": "接管后"})
+    assert client.get("/public/current").json()["timelines"][0]["status"] == "normal"
+    old = client.get(f"/publications/{pub_id}").json()
+    assert old["timelines"][0]["status"] == "warning"
+
+
+def test_preview_follows_takeover_selection(client, station, device):
+    add_device(client, station, "DEV-002")
+    # 自 0 起由 DEV-002 接管：DEV-001 的高水位读数不入选
+    make_takeover(client, station, "DEV-002", 0, reason="全程备用机")
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 9.5)
+    # 预演把上升阈值降到 9：若误用未入选读数会预警；遵循选数规则 → 无入选读数，仍正常
+    pv = preview_version(client, station, 0, 9.0, 7.0).json()
+    assert pv["preview"]["status"] == "normal"
+    assert pv["preview"]["readings_considered"] == 0
+    assert all(x["selected"] is False for x in pv["preview"]["readings"])
+    # 预演不落库：接管记录不变、版本历史仍为空、待发布查询不变
+    assert len(takeovers(client, station)) == 1
+    assert client.get(f"/stations/{station}/threshold-versions").json()["versions"] == []
+    assert timeline(client, station)["status"] == "normal"

@@ -321,5 +321,73 @@ curl -s -w '未知凭证 → HTTP %{http_code}\n' -o /dev/null -X POST "$BASE/pu
   -d '{"token":"not-a-real-token"}'
 echo "历史快照数（不受受控发布影响，仅新增不改写）: $(curl -s "$BASE/publications" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
 
+# ---------------------------------------------------------------
+# 设备接管（汛期一站多设备轮值）：在新站 8 上完整演示
+# ---------------------------------------------------------------
+
+step "39. 登记新站与两台轮值设备（主 DEV-008A / 备 DEV-008B），主设备 3 条高水位 → 预警"
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"北涧站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations/8/devices" -H "$J" -d '{"device_no":"DEV-008A"}' > /dev/null
+curl -s -X POST "$BASE/stations/8/devices" -H "$J" -d '{"device_no":"DEV-008B"}' > /dev/null
+for m in 00 05 10; do
+  curl -s -X POST "$BASE/readings" -H "$J" \
+    -d "{\"device_no\":\"DEV-008A\",\"seq\":80$m,\"observed_at\":\"2026-10-01T13:$m:00+08:00\",\"water_level\":12.0}" > /dev/null
+done
+echo "接管前（首条接管前沿用全部设备读数）: $(curl -s "$BASE/stations/8/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')"
+
+step "40. 登记接管：自 2026-10-01T13:15+08:00 起由备用机 DEV-008B 接管（设备号 + 带时区生效时刻 + 非空原因）"
+curl -s -X POST "$BASE/stations/8/device-takeovers" -H "$J" \
+  -d '{"device_no":"DEV-008B","effective_at":"2026-10-01T13:15:00+08:00","reason":"主设备通信中断，切换备用机"}'; echo
+
+step "41. 选数规则：主设备低水位不入选（缺测不借用其他设备），备用机低水位才解除"
+for m in 15 20 25; do
+  curl -s -X POST "$BASE/readings" -H "$J" \
+    -d "{\"device_no\":\"DEV-008A\",\"seq\":81$m,\"observed_at\":\"2026-10-01T13:$m:00+08:00\",\"water_level\":7.0}" > /dev/null
+done
+echo "仅主设备报低水位后: $(curl -s "$BASE/stations/8/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')（仍预警）"
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-008B","seq":915,"observed_at":"2026-10-01T13:15:00+08:00","water_level":7.0}' > /dev/null
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-008B","seq":921,"observed_at":"2026-10-01T13:21:00+08:00","water_level":7.0}' > /dev/null
+curl -s "$BASE/stations/8/timeline" | python3 -c '
+import sys, json
+tl = json.load(sys.stdin)
+print("备用机低水位后:", tl["status"], "| 入选裁定读数:", tl["readings_considered"])
+for r in tl["readings"]:
+    print("  读数", r["reading_id"], r["device_no"], r["observed_at"],
+          "入选" if r["selected"] else "未入选", "| 接管记录", r["takeover_id"])
+'
+
+step "42. 查询接管记录（按生效时刻升序，含设备与原因）；未入选读数仍可查询"
+curl -s "$BASE/stations/8/device-takeovers"; echo
+echo "站内全部有效读数（含未入选）: $(curl -s "$BASE/stations/8/readings" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))') 条"
+
+step "43. 接管登记校验：未知站/未知设备 404、跨站设备/无时区/空原因 400、同站重复生效时刻 409"
+curl -s -o /dev/null -w '未知监测站          → HTTP %{http_code}\n' -X POST "$BASE/stations/999/device-takeovers" -H "$J" \
+  -d '{"device_no":"DEV-008B","effective_at":"2026-10-01T14:00:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '未知设备号          → HTTP %{http_code}\n' -X POST "$BASE/stations/8/device-takeovers" -H "$J" \
+  -d '{"device_no":"NOPE","effective_at":"2026-10-01T14:00:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '跨站设备            → HTTP %{http_code}\n' -X POST "$BASE/stations/8/device-takeovers" -H "$J" \
+  -d '{"device_no":"DEV-001","effective_at":"2026-10-01T14:00:00+08:00","reason":"x"}'
+curl -s -o /dev/null -w '生效时刻不带时区    → HTTP %{http_code}\n' -X POST "$BASE/stations/8/device-takeovers" -H "$J" \
+  -d '{"device_no":"DEV-008B","effective_at":"2026-10-01T14:00:00","reason":"x"}'
+curl -s -o /dev/null -w '空原因              → HTTP %{http_code}\n' -X POST "$BASE/stations/8/device-takeovers" -H "$J" \
+  -d '{"device_no":"DEV-008B","effective_at":"2026-10-01T14:00:00+08:00","reason":"  "}'
+curl -s -o /dev/null -w '同站重复生效时刻(Z) → HTTP %{http_code}\n' -X POST "$BASE/stations/8/device-takeovers" -H "$J" \
+  -d '{"device_no":"DEV-008A","effective_at":"2026-10-01T05:15:00Z","reason":"同一瞬间"}'
+
+step "44. 接管登记使已核对凭证失效；公开结果须重新发布才更新，历史快照不改写"
+TOKEN3=$(curl -s -X POST "$BASE/publish/checks" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST "$BASE/stations/8/device-takeovers" -H "$J" \
+  -d '{"device_no":"DEV-008A","effective_at":"2026-10-01T13:30:00+08:00","reason":"主设备恢复，切回主用"}' > /dev/null
+curl -s -w '核对后登记接管 → 确认 HTTP %{http_code}（409 拒绝，不生成发布记录）\n' -o /dev/null \
+  -X POST "$BASE/publish/confirm" -H "$J" -d "{\"token\":\"$TOKEN3\"}"
+echo "公开站 8（重新发布前）: $(curl -s -o /dev/null -w '%{http_code}' "$BASE/public/stations/8/timeline")（404 尚无已发布结果）"
+TOKEN4=$(curl -s -X POST "$BASE/publish/checks" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST "$BASE/publish/confirm" -H "$J" -d "{\"token\":\"$TOKEN4\",\"note\":\"接管轮值后受控发布\"}" \
+  | python3 -c 'import sys,json;print("重新发布号:",json.load(sys.stdin)["publication_id"])'
+echo "公开站 8（重新发布后）: $(curl -s "$BASE/public/stations/8/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')"
+
 echo
 echo "演示完成。交互式文档：$BASE/docs"

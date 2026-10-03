@@ -89,6 +89,23 @@ class ThresholdVersionCreate(BaseModel):
         return self
 
 
+class DeviceTakeoverCreate(BaseModel):
+    """汛期轮值：登记某站一台设备的接管记录（自生效时刻起仅该设备读数进入本站裁定）。"""
+
+    device_no: str = Field(min_length=1, max_length=100, description="设备号（须为本站已登记设备）")
+    effective_at: datetime = Field(description="带时区的生效时刻，如 2026-10-02T08:00:00+08:00")
+    reason: str = Field(min_length=1, max_length=500, description="接管原因（非空）")
+
+    _tz = field_validator("effective_at")(_require_tz_aware)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("接管原因不得为空白")
+        return v
+
+
 class ZoneCreate(BaseModel):
     """登记防汛责任区：非空名称、带时区生效时间、互不重复的成员站 ID、触发站数 K。"""
 
