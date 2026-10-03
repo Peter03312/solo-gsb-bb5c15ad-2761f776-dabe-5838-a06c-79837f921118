@@ -891,6 +891,383 @@ def test_preview_does_not_change_frozen_publication(client, station, device):
     assert [p["publication_id"] for p in client.get("/publications").json()] == [pub_id]
 
 
+# ---------------------------------------------------------------- 设备轮值接管（汛期一站多设备）
+
+def second_device(client, station, device_no="DEV-002"):
+    r = client.post(f"/stations/{station}/devices", json={"device_no": device_no})
+    assert r.status_code == 201, r.text
+    return device_no
+
+
+def register_takeover(client, station_id, device_no, minutes, reason="汛期轮值", tz=None):
+    eff = BASE + timedelta(minutes=minutes)
+    if tz is not None:
+        eff = eff.astimezone(tz)
+    return client.post(
+        f"/stations/{station_id}/device-takeovers",
+        json={"device_no": device_no, "effective_at": iso(eff), "reason": reason},
+    )
+
+
+def test_takeover_registration_persists_and_lists(client, station, device):
+    r = register_takeover(client, station, device, 30, reason="甲机接管")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["takeover"]["id"] == 1
+    assert body["takeover"]["station_id"] == station
+    assert body["takeover"]["device"]["device_no"] == "DEV-001"
+    assert body["takeover"]["effective_at"] == iso(BASE + timedelta(minutes=30)).replace("+00:00", "Z")
+    assert body["takeover"]["reason"] == "甲机接管"
+    assert body["pending_adjudication"]["status"] == "normal"
+    lst = client.get(f"/stations/{station}/device-takeovers").json()
+    assert len(lst["takeovers"]) == 1
+    assert lst["takeovers"][0]["device"]["device_no"] == "DEV-001"
+
+
+def test_takeover_list_sorted_by_effective_at(client, station, device):
+    other = second_device(client, station)
+    register_takeover(client, station, other, 30)
+    register_takeover(client, station, device, 10)
+    register_takeover(client, station, other, 20)
+    effs = [t["effective_at"] for t in client.get(f"/stations/{station}/device-takeovers").json()["takeovers"]]
+    assert effs == [
+        iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z"),
+        iso(BASE + timedelta(minutes=20)).replace("+00:00", "Z"),
+        iso(BASE + timedelta(minutes=30)).replace("+00:00", "Z"),
+    ]
+
+
+def test_takeover_unknown_station_404(client, device):
+    r = register_takeover(client, 999, device, 0)
+    assert r.status_code == 404
+    assert client.get("/stations/999/device-takeovers").status_code == 404
+
+
+def test_takeover_unknown_device_404(client, station):
+    r = register_takeover(client, station, "NOPE", 0)
+    assert r.status_code == 404
+
+
+def test_takeover_cross_station_device_400(client, station, device):
+    # 再登记一个站；将站 1 的设备登记到站 2 → 参数错误（跨站设备）
+    r2 = client.post("/stations", json={"name": "乙站", "rise_threshold": 10.0, "clear_threshold": 8.0})
+    other_station = r2.json()["id"]
+    r = register_takeover(client, other_station, device, 0)
+    assert r.status_code == 400
+    assert "device_station_id" in r.json()["detail"]
+
+
+def test_takeover_naive_effective_at_400(client, station, device):
+    r = client.post(
+        f"/stations/{station}/device-takeovers",
+        json={"device_no": device, "effective_at": "2026-10-01T00:00:00", "reason": "x"},
+    )
+    assert r.status_code == 400
+
+
+def test_takeover_blank_reason_400(client, station, device):
+    for bad in ("", "   "):
+        r = client.post(
+            f"/stations/{station}/device-takeovers",
+            json={"device_no": device, "effective_at": iso(BASE), "reason": bad},
+        )
+        assert r.status_code == 400
+
+
+def test_takeover_blank_device_no_400(client, station):
+    r = client.post(
+        f"/stations/{station}/device-takeovers",
+        json={"device_no": "   ", "effective_at": iso(BASE), "reason": "x"},
+    )
+    assert r.status_code == 400
+
+
+def test_takeover_duplicate_effective_instant_conflict(client, station, device):
+    other = second_device(client, station)
+    r1 = register_takeover(client, station, device, 60)
+    assert r1.status_code == 201
+    # 同一瞬间（不同时区表示）→ 409，即使指定的是另一台设备
+    r2 = register_takeover(
+        client, station, other, 60, tz=timezone(timedelta(hours=8))
+    )
+    assert r2.status_code == 409
+    # 不同时刻允许
+    r3 = register_takeover(client, station, other, 61)
+    assert r3.status_code == 201
+
+
+def test_takeover_duplicate_scope_per_station(client, station, device):
+    # 不同站同一生效时刻互不影响
+    other_station = client.post(
+        "/stations", json={"name": "乙站", "rise_threshold": 10.0, "clear_threshold": 8.0}
+    ).json()["id"]
+    other_dev = client.post(f"/stations/{other_station}/devices", json={"device_no": "DEV-009"}).json()["device_no"]
+    assert register_takeover(client, station, device, 60).status_code == 201
+    assert register_takeover(client, other_station, other_dev, 60).status_code == 201
+
+
+def test_before_first_takeover_all_devices_selected(client, station, device):
+    other = second_device(client, station)
+    upload(client, device, 1, 0, 12.0)
+    upload(client, other, 2, 5, 12.0)
+    # 首条接管在 30 分钟；此前 A、B 各一条虽不足预警，但两条都进入裁定
+    r = register_takeover(client, station, device, 30)
+    assert r.status_code == 201
+    tl = timeline(client, station)
+    assert tl["active_readings_total"] == 2
+    assert tl["readings_considered"] == 2
+    assert all(r_["selected"] for r_ in tl["readings"])
+    assert all(r_["takeover_id"] is None for r_ in tl["readings"])
+
+
+def test_takeover_exact_boundary_includes_instant(client, station, device):
+    other = second_device(client, station)
+    # DEV-001 三条达阈值（0/5/10）；接管时刻 t=10 切给 DEV-002
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    assert timeline(client, station)["status"] == "warning"
+    register_takeover(client, station, other, 10)  # 含同刻：DEV-001 的 t=10 读数落选
+    tl = timeline(client, station)
+    by_id = {r["reading_id"]: r for r in tl["readings"]}
+    assert by_id[1]["selected"] is True and by_id[1]["takeover_id"] is None
+    assert by_id[3]["selected"] is False and by_id[3]["takeover_id"] == 1
+    # 只剩两条入选，不构成预警
+    assert tl["readings_considered"] == 2
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+
+
+def test_takeover_missing_does_not_borrow_other_device(client, station, device):
+    other = second_device(client, station)
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    # t=0 起就接管给 DEV-002：DEV-001 全部落选；DEV-002 缺测 → considered=0，不借用
+    register_takeover(client, station, other, 0)
+    tl = timeline(client, station)
+    assert tl["readings_considered"] == 0
+    assert tl["active_readings_total"] == 3
+    assert tl["status"] == "normal"
+    assert all(not r_["selected"] for r_ in tl["readings"])
+    # DEV-002 补 2 条仍不足 3 → 无预警
+    upload(client, other, 10, 15, 12.0)
+    upload(client, other, 11, 20, 12.0)
+    tl = timeline(client, station)
+    assert tl["readings_considered"] == 2
+    assert tl["status"] == "normal"
+
+
+def test_takeover_switches_device_and_latest_wins(client, station, device):
+    other = second_device(client, station)
+    # DEV-001 达阈值预警
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    assert timeline(client, station)["status"] == "warning"
+    # t=10 起接管给 DEV-002（追溯）：DEV-001 的 t=10 落选，预警消失
+    register_takeover(client, station, other, 10)
+    assert timeline(client, station)["status"] == "normal"
+    # DEV-002 在 10/15/25 补 3 条 → 入选序列 DEV-001@0/5 + DEV-002@10/15/25，
+    # 同段连续 5 条达阈值；连续 3 条（@0/5/10）首尾恰为 10 分钟，预警在 DEV-002@10 发出
+    upload(client, other, 20, 10, 12.0)
+    upload(client, other, 21, 15, 12.0)
+    upload(client, other, 22, 25, 12.0)
+    tl = timeline(client, station)
+    assert tl["status"] == "warning"
+    assert tl["events"][0]["at"] == iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z")
+    # t=20 起再切回 DEV-001：DEV-002@25 落选
+    register_takeover(client, station, device, 20)
+    tl = timeline(client, station)
+    by_dev_time = {(r["device_no"], r["observed_at"]): r for r in tl["readings"]}
+    z = iso(BASE + timedelta(minutes=25)).replace("+00:00", "Z")
+    assert by_dev_time[("DEV-002", z)]["selected"] is False
+    assert by_dev_time[("DEV-002", z)]["takeover_id"] == 2
+
+
+def test_unselected_readings_still_queryable(client, station, device):
+    other = second_device(client, station)
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    register_takeover(client, station, other, 0)
+    # 未入选读数仍出现在站内读数查询（有效读数列表不被接管改变）
+    rows = client.get(f"/stations/{station}/readings").json()
+    assert len(rows) == 3
+    assert {r["device_no"] for r in rows} == {"DEV-001"}
+
+
+def test_takeover_retroactive_recomputes(client, station, device):
+    # 先预警，事后追溯登记一条更早生效的接管 → 历史事件随重算消失
+    other = second_device(client, station)
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    assert timeline(client, station)["status"] == "warning"
+    r = register_takeover(client, station, other, 0, reason="追溯接管")
+    assert r.status_code == 201
+    assert r.json()["pending_adjudication"]["status"] == "normal"
+    assert r.json()["pending_adjudication"]["events"] == []
+    assert timeline(client, station)["status"] == "normal"
+
+
+def test_takeover_recompute_after_backfill_correction_void(client, station, device):
+    other = second_device(client, station)
+    register_takeover(client, station, other, 0)
+    # DEV-002 两条达阈值（不足 3）
+    upload(client, other, 1, 0, 12.0)
+    upload(client, other, 2, 5, 12.0)
+    assert timeline(client, station)["status"] == "normal"
+    # 补传第三条（首尾 10 分钟）→ 预警
+    upload(client, other, 3, 10, 12.0)
+    assert timeline(client, station)["status"] == "warning"
+    # 作废第三条 → 回到正常
+    rows = client.get(f"/stations/{station}/readings").json()
+    rid = next(r["id"] for r in rows if r["seq"] == 3)
+    vr = client.post(f"/readings/{rid}/void", json={"reason": "误报"})
+    assert vr.json()["pending_adjudication"]["status"] == "normal"
+    # 更正剩余读数水位 → 仍 normal（验证更正后按观测时间重算选数）
+    rows = client.get(f"/stations/{station}/readings").json()
+    rid1 = next(r["id"] for r in rows if r["seq"] == 1)
+    cr = client.post(f"/readings/{rid1}/correct", json={"water_level": 1.0, "reason": "修正"})
+    assert cr.status_code == 200
+    assert cr.json()["pending_adjudication"]["status"] == "normal"
+
+
+def test_takeover_zone_recomputes(client, station, device):
+    # 本站与另一站组 K=1；追溯接管使本站解除预警 → 区域随之重算
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    other_station = client.post(
+        "/stations", json={"name": "乙站", "rise_threshold": 10.0, "clear_threshold": 8.0}
+    ).json()["id"]
+    od = client.post(f"/stations/{other_station}/devices", json={"device_no": "DEV-009"}).json()["device_no"]
+    upload(client, od, 1, 0, 5.0)
+    upload(client, od, 2, 5, 5.0)
+    z = client.post(
+        "/zones",
+        json={"name": "片区", "effective_at": iso(BASE), "station_ids": [station, other_station], "trigger_count": 1},
+    ).json()
+    zone_id = z["id"]
+    ztl = client.get(f"/zones/{zone_id}/timeline").json()
+    assert ztl["status"] == "warning"
+    assert ztl["warning_station_ids"] == [station]
+    # 追溯接管给本站的新设备（无读数）→ 本站 normal，区域 normal
+    second = second_device(client, station)
+    register_takeover(client, station, second, 0)
+    ztl = client.get(f"/zones/{zone_id}/timeline").json()
+    assert ztl["status"] == "normal"
+    assert ztl["warning_station_ids"] == []
+    assert client.get(f"/stations/{station}/timeline").json()["status"] == "normal"
+
+
+def test_takeover_invalidates_publish_check_token(client, station, device):
+    _make_warning(client, device)
+    token = client.post("/publish/checks").json()["token"]
+    other = second_device(client, station)
+    r = register_takeover(client, station, other, 10000, reason="未来生效，仍作废旧凭证")
+    assert r.status_code == 201
+    cr = client.post("/publish/confirm", json={"token": token})
+    assert cr.status_code == 409
+    assert cr.json()["detail"]["reason"] == "data_changed_after_check"
+    # 未生成发布
+    assert client.get("/publications").json() == []
+
+
+def test_takeover_public_snapshot_unchanged_until_republish(client, station, device):
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    pub1 = client.post("/publish", json={"note": "接管前"}).json()["publication_id"]
+    other = second_device(client, station)
+    register_takeover(client, station, other, 0)  # 追溯：待发布变 normal
+    assert timeline(client, station)["status"] == "normal"
+    # 公开结果仍是冻结的 warning
+    pub_tl = client.get(f"/public/stations/{station}/timeline").json()
+    assert pub_tl["status"] == "warning"
+    # 历史发布快照内容不改写（旧快照无 selected 等新字段也保持原样）
+    old = client.get(f"/publications/{pub1}").json()
+    assert old["timelines"][0]["status"] == "warning"
+    # 重新发布后公开才更新
+    pub2 = client.post("/publish", json={"note": "接管后"}).json()["publication_id"]
+    assert pub2 > pub1
+    assert client.get(f"/public/stations/{station}/timeline").json()["status"] == "normal"
+    # 新快照带接管选数字段，旧快照依旧
+    assert client.get(f"/publications/{pub2}").json()["timelines"][0]["readings_considered"] == 0
+    assert client.get(f"/publications/{pub1}").json()["timelines"][0]["status"] == "warning"
+
+
+def test_preview_follows_takeover_selection(client, station, device):
+    # DEV-001/DEV-002：t=10 起接管给 DEV-002；阈值预演也只对入选读数生效
+    other = second_device(client, station)
+    upload(client, device, 1, 0, 9.5)   # 基准 10：不达
+    upload(client, device, 2, 10, 9.5)  # 接管时刻落选为 DEV-002（不入选）
+    upload(client, other, 10, 10, 9.5)  # 入选（接管给 DEV-002）
+    upload(client, other, 11, 15, 9.5)
+    upload(client, other, 12, 25, 9.5)
+    register_takeover(client, station, other, 10)
+    # 预演：自 t=0 起上升阈值降到 9 → 入选序列 DEV-001@0(9.5), DEV-002@10/15/25
+    pv = preview_version(client, station, 0, 9.0, 7.0).json()
+    assert pv["dry_run"] is True
+    assert pv["current"]["status"] == "normal"
+    assert pv["preview"]["status"] == "warning"
+    # 落选的 DEV-001@10 在预演读数中仍标记 selected=false，不参与裁定
+    marks = {(r["device_no"], r["observed_at"]): r["selected"] for r in pv["preview"]["readings"]}
+    z10 = iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z")
+    assert marks[("DEV-001", z10)] is False
+    assert marks[("DEV-002", z10)] is True
+    assert pv["preview"]["readings_considered"] == 4
+    # 预演不落库
+    assert client.get(f"/stations/{station}/threshold-versions").json()["versions"] == []
+    assert timeline(client, station)["status"] == "normal"
+
+
+def test_takeover_selection_with_threshold_versions(client, station, device):
+    # 接管选数与阈值版本正交：落选读数即使命中版本也不参与裁定
+    other = second_device(client, station)
+    make_version(client, station, 5, 9.0, 7.0)
+    upload(client, device, 1, 5, 9.5)
+    upload(client, device, 2, 10, 9.5)
+    register_takeover(client, station, other, 10)  # DEV-001@10 落选
+    upload(client, other, 20, 10, 9.5)
+    tl = timeline(client, station)
+    by_id = {r["reading_id"]: r for r in tl["readings"]}
+    assert by_id[2]["selected"] is False
+    assert by_id[3]["selected"] is True and by_id[3]["threshold_version_id"] is not None
+    # 入选仅 DEV-001@5 与 DEV-002@10，两条 → 无预警
+    assert tl["readings_considered"] == 2
+    assert tl["status"] == "normal"
+
+
+def test_takeover_segment_gap_applies_across_devices(client, station, device):
+    # 接管前后跨设备读数：间隔 > 15 分钟仍断段（选数后同一时间线判定）
+    other = second_device(client, station)
+    upload(client, device, 1, 0, 12.0)
+    upload(client, device, 2, 5, 12.0)
+    register_takeover(client, station, other, 10)
+    # DEV-002 首次读数在 t=30（与 DEV-001@5 间隔 25 分钟 → 断段），其后 40/45 共 3 条
+    upload(client, other, 30, 30, 12.0)
+    upload(client, other, 31, 40, 12.0)
+    upload(client, other, 32, 45, 12.0)
+    # 入选：DEV-001@0/5 一段（2 条），DEV-002@30/40/45 另一段；
+    # 新段 3 条首尾 15 分钟（≥10）→ 预警，触发读数来自接管设备 DEV-002
+    tl = timeline(client, station)
+    assert tl["status"] == "warning"
+    assert tl["events"][0]["reading_id"] == [
+        r["reading_id"] for r in tl["readings"]
+        if r["device_no"] == "DEV-002" and r["observed_at"].endswith("00:45:00Z")
+    ][0]
+    assert len(tl["segments"]) == 2
+
+
+def test_takeover_segment_gap_blocks_run_across_devices(client, station, device):
+    # 断段后新接管设备不足连续条数 → 不预警（缺测不借用，且段不连续）
+    other = second_device(client, station)
+    upload(client, device, 1, 0, 12.0)
+    upload(client, device, 2, 5, 12.0)
+    register_takeover(client, station, other, 10)
+    upload(client, other, 30, 30, 12.0)   # 与 DEV-001@5 间隔 25 分钟 → 断段
+    upload(client, other, 31, 40, 12.0)   # 新段仅 2 条
+    tl = timeline(client, station)
+    assert tl["readings_considered"] == 4
+    assert len(tl["segments"]) == 2
+    assert tl["status"] == "normal"
+
+
 # ---------------------------------------------------------------- 发布冻结
 
 def test_publish_freezes_timeline(client, station, device):
@@ -1648,6 +2025,7 @@ def test_event_occurrence_distinguishes_repeated_events(client, station, device)
         "zone",
         "station",
         "device",
+        "takeover",
     ],
 )
 def test_confirm_rejected_after_affecting_write(client, station, device, invalidate):
@@ -1684,6 +2062,9 @@ def test_confirm_rejected_after_affecting_write(client, station, device, invalid
         client.post("/stations", json={"name": "新站", "rise_threshold": 10.0, "clear_threshold": 8.0})
     elif invalidate == "device":
         client.post(f"/stations/{station}/devices", json={"device_no": "DEV-002"})
+    elif invalidate == "takeover":
+        other = client.post(f"/stations/{station}/devices", json={"device_no": "DEV-002"}).json()["device_no"]
+        register_takeover(client, station, other, 10000)
 
     r = confirm(client, token)
     assert r.status_code == 409
@@ -1846,3 +2227,26 @@ def test_check_data_version_advances(client, station, device):
     d3 = check(client)
     assert d3["data_version"] == v0 + 4
     assert d3["baseline_publication_id"] is not None
+
+
+def test_check_diff_shows_events_removed_after_retroactive_takeover(client, station, device):
+    # 先发布 warning 快照；追溯接管使预警消失 → 核对应报告事件消失、状态前后值变化
+    _make_warning(client, device)
+    client.post("/publish", json={"note": "接管前"})
+    other = second_device(client, station)
+    register_takeover(client, station, other, 0)
+    chk = check(client)
+    sd = next(s for s in chk["stations"] if s["station_id"] == station)
+    assert sd["status_before"] == "warning"
+    assert sd["status_after"] == "normal"
+    assert sd["changed"] is True
+    assert sd["events_removed"] == [{"type": "warning", "at": iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z"), "occurrence": 1}]
+    assert sd["events_added"] == []
+    assert chk["summary"]["events_removed"]["station_warning"] == 1
+
+
+def test_takeover_registration_advances_data_version(client, station, device):
+    other = second_device(client, station)
+    v0 = check(client)["data_version"]
+    register_takeover(client, station, other, 100)
+    assert check(client)["data_version"] == v0 + 1

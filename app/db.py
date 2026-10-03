@@ -71,6 +71,16 @@ CREATE TABLE IF NOT EXISTS threshold_versions (
     UNIQUE (station_id, effective_at)  -- 同站生效时刻唯一（含不同时区表示的同一时刻）
 );
 
+CREATE TABLE IF NOT EXISTS device_takeovers (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id   INTEGER NOT NULL REFERENCES stations(id),
+    device_id    INTEGER NOT NULL REFERENCES devices(id),  -- 接管设备（须隶属本站）
+    effective_at TEXT NOT NULL,   -- 生效时间（UTC ISO8601，登记时必带时区）；自该时刻（含同刻）起仅该设备入选
+    reason       TEXT NOT NULL,   -- 接管原因（非空）
+    created_at   TEXT NOT NULL,
+    UNIQUE (station_id, effective_at)  -- 同站同一生效瞬间只允许一条接管记录
+);
+
 CREATE TABLE IF NOT EXISTS publications (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     published_at TEXT NOT NULL,

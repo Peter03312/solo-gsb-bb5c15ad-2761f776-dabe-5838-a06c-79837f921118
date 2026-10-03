@@ -24,6 +24,7 @@ from .db import Database
 from .schemas import (
     CorrectRequest,
     DeviceCreate,
+    DeviceTakeoverCreate,
     PublishConfirmRequest,
     PublishRequest,
     ReadingIngest,
@@ -170,8 +171,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.4.0",
-        description="监测站/设备登记、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动，以及受控发布（核对凭证 → 确认冻结）。",
+        version="1.5.0",
+        description="监测站/设备登记、汛期一站多设备轮值接管选数、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动，以及受控发布（核对凭证 → 确认冻结）。",
     )
     app.state.db = db
     app.state.settings = settings
@@ -222,6 +223,29 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         v = versions[idx]
         return v["rise_threshold"], v["clear_threshold"], v["id"]
 
+    def load_device_takeovers(conn: sqlite3.Connection, station_id: int) -> list[sqlite3.Row]:
+        """按生效时刻升序返回某站全部设备接管记录（effective_at 为归一化 UTC 字符串）。"""
+        return conn.execute(
+            """
+            SELECT * FROM device_takeovers
+            WHERE station_id=?
+            ORDER BY effective_at, id
+            """,
+            (station_id,),
+        ).fetchall()
+
+    def resolve_takeover(
+        takeovers: list[sqlite3.Row], obs: datetime
+    ) -> Optional[sqlite3.Row]:
+        """按观测时间取最近已生效的接管记录：effective_at <= obs 中最晚者；
+        同一时刻采用该接管（bisect_right，边界包含）。无接管生效时返回 None。
+        """
+        effective_times = [parse_stored(t["effective_at"]) for t in takeovers]
+        idx = bisect_right(effective_times, obs) - 1
+        if idx < 0:
+            return None
+        return takeovers[idx]
+
     def candidate_version_row(
         station_id: int, effective_at: datetime, rise: float, clear: float, reason: str
     ) -> dict[str, Any]:
@@ -249,6 +273,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         extra_versions 给出不落库的候选版本（仅预演使用）：与既有版本合并后，
         各读数仍按“观测时间取最近已生效版本、同刻采用新版本”的同一规则命中阈值。
+
+        设备轮值接管选数规则（对预演同样生效）：
+        - 首条接管生效时刻之前的全部有效读数均进入本站裁定；
+        - 自生效时刻起（含同刻），仅“观测时刻最近一条接管记录”所指定设备的有效读数入选；
+          该设备缺测不借用其他设备读数；未入选读数仍在 readings 中可查（selected=false）。
         """
         st = conn.execute("SELECT * FROM stations WHERE id=?", (station_id,)).fetchone()
         if st is None:
@@ -260,9 +289,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             # 正常预演路径下同刻二者不会同时出现。
             versions = versions + [v for v in extra_versions if v["station_id"] == station_id]
             versions.sort(key=lambda v: (parse_stored(v["effective_at"]), v["id"]))
+        takeovers = load_device_takeovers(conn, station_id)
         rows = conn.execute(
             """
-            SELECT r.id, r.observed_at, r.water_level
+            SELECT r.id, r.observed_at, r.water_level, r.device_id, d.device_no AS device_no
             FROM readings r
             JOIN devices d ON d.id = r.device_id
             WHERE d.station_id = ? AND r.status = 'active'
@@ -278,26 +308,34 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             if version_id is None:
                 # 未命中任何已生效版本 → 采用站点登记基准阈值
                 rise, clear = st["rise_threshold"], st["clear_threshold"]
-            readings.append(
-                Reading(
-                    id=r["id"],
-                    observed_at=obs,
-                    water_level=r["water_level"],
-                    rise_threshold=rise,
-                    clear_threshold=clear,
-                    threshold_version_id=version_id,
-                )
-            )
+            takeover = resolve_takeover(takeovers, obs)
+            selected = takeover is None or takeover["device_id"] == r["device_id"]
             applied.append(
                 {
                     "reading_id": r["id"],
+                    "device_id": r["device_id"],
+                    "device_no": r["device_no"],
                     "observed_at": iso_z(obs),
                     "water_level": r["water_level"],
                     "rise_threshold": rise,
                     "clear_threshold": clear,
                     "threshold_version_id": version_id,  # null 表示使用登记基准值
+                    # 设备轮值选数：是否进入本站裁定；未入选时给出所归属（落选）的接管记录
+                    "selected": selected,
+                    "takeover_id": takeover["id"] if takeover is not None else None,
                 }
             )
+            if selected:
+                readings.append(
+                    Reading(
+                        id=r["id"],
+                        observed_at=obs,
+                        water_level=r["water_level"],
+                        rise_threshold=rise,
+                        clear_threshold=clear,
+                        threshold_version_id=version_id,
+                    )
+                )
         res = adjudicate(readings, st["rise_threshold"], st["clear_threshold"], rules)
         return {
             "station_id": station_id,
@@ -308,6 +346,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "status": res.status,
             "active_warning_since": iso_z(res.active_warning_since) if res.active_warning_since else None,
             "readings_considered": res.readings_considered,
+            # 站内全部有效读数数；readings_considered 为经接管选数后实际进入裁定的数量
+            "active_readings_total": len(applied),
             "events": [
                 {
                     "type": e.type,
@@ -560,6 +600,121 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             {"id": r["id"], "device_no": r["device_no"], "station_id": r["station_id"], "created_at": r["created_at"]}
             for r in rows
         ]
+
+    # ------------------------------------------------------------ 设备轮值接管（汛期一站多设备）
+
+    def device_takeover_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        dev = {
+            "id": row["device_id"],
+            "device_no": row["device_no"],
+            "station_id": row["station_id"],
+        }
+        return {
+            "id": row["id"],
+            "station_id": row["station_id"],
+            "effective_at": iso_z(parse_stored(row["effective_at"])),
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+            "device": dev,
+        }
+
+    @app.post("/stations/{station_id}/device-takeovers", status_code=201, tags=["设备接管"])
+    def create_device_takeover(station_id: int, body: DeviceTakeoverCreate) -> dict[str, Any]:
+        """登记一条本站设备轮值接管记录。
+
+        - 输入设备号、**带时区**的生效时刻和**非空**原因；
+        - 自生效时刻起（含同刻）仅最近接管记录指定设备的有效读数进入本站裁定，
+          缺测不借用其他设备，未入选读数仍可查询；
+        - 同站同一生效瞬间（UTC 归一化，含不同时区表示）只允许一条 → 409；
+        - 监测站不存在 → 404；设备号不存在 → 404；设备不隶属本站（跨站）→ 400；
+          生效时刻无时区 / 原因为空（含纯空白）→ 400；
+        - 登记后待发布站点及所属责任区按观测时间重算；接管登记本身不产生事件，
+          并使此前的受控发布核对凭证失效；已冻结的公开结果须重新发布才更新。
+        """
+        eff_utc = body.effective_at.astimezone(timezone.utc)
+        eff_str = eff_utc.isoformat()
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            get_station_or_404(conn, station_id)
+            dev = conn.execute(
+                "SELECT * FROM devices WHERE device_no=?", (body.device_no,)
+            ).fetchone()
+            if dev is None:
+                raise HTTPException(status_code=404, detail=f"未知设备号 {body.device_no}")
+            if dev["station_id"] != station_id:
+                # 设备存在但隶属其他站 → 参数错误（跨站设备）
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": f"设备 {body.device_no} 不属于监测站 {station_id}",
+                        "device_no": body.device_no,
+                        "device_station_id": dev["station_id"],
+                    },
+                )
+            dup = conn.execute(
+                "SELECT id FROM device_takeovers WHERE station_id=? AND effective_at=?",
+                (station_id, eff_str),
+            ).fetchone()
+            if dup is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": f"监测站 {station_id} 已存在生效时间 {iso_z(eff_utc)} 的接管记录",
+                        "existing_takeover_id": dup["id"],
+                    },
+                )
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO device_takeovers(station_id, device_id, effective_at, reason, created_at)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (station_id, dev["id"], eff_str, body.reason, now),
+                )
+            except sqlite3.IntegrityError:
+                # 并发下 (station_id, effective_at) 唯一约束兜底
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"监测站 {station_id} 已存在生效时间 {iso_z(eff_utc)} 的接管记录",
+                )
+            row = conn.execute(
+                """
+                SELECT t.*, d.device_no AS device_no
+                FROM device_takeovers t JOIN devices d ON d.id = t.device_id
+                WHERE t.id=?
+                """,
+                (cur.lastrowid,),
+            ).fetchone()
+            timeline = compute_timeline(conn, station_id)
+            # 接管登记改变选数结果 → 推进数据版本，作废此前的受控发布核对凭证
+            bump_data_version(conn)
+        return {
+            "takeover": device_takeover_to_dict(row),
+            "pending_adjudication": {
+                "station_id": station_id,
+                "status": timeline["status"],
+                "events": timeline["events"],
+            },
+        }
+
+    @app.get("/stations/{station_id}/device-takeovers", tags=["设备接管"])
+    def list_device_takeovers(station_id: int) -> dict[str, Any]:
+        """查询某站设备轮值接管记录（按生效时刻升序）。"""
+        with db.read() as conn:
+            get_station_or_404(conn, station_id)
+            rows = conn.execute(
+                """
+                SELECT t.*, d.device_no AS device_no
+                FROM device_takeovers t JOIN devices d ON d.id = t.device_id
+                WHERE t.station_id=?
+                ORDER BY t.effective_at, t.id
+                """,
+                (station_id,),
+            ).fetchall()
+        return {
+            "station_id": station_id,
+            "takeovers": [device_takeover_to_dict(r) for r in rows],
+        }
 
     # ------------------------------------------------------------ 读数补传（幂等）
 

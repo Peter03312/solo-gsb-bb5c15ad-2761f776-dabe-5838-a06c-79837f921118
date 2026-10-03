@@ -30,6 +30,27 @@ class DeviceCreate(BaseModel):
     device_no: str = Field(min_length=1, max_length=100, description="设备号（全局唯一）")
 
 
+class DeviceTakeoverCreate(BaseModel):
+    """汛期一站多设备轮值：登记本站设备的接管记录。
+
+    自生效时刻（含同刻）起，仅该接管记录指定设备的有效读数进入本站裁定，
+    缺测不借用其他设备；同站同一生效瞬间只允许一条。
+    """
+
+    device_no: str = Field(min_length=1, max_length=100, description="接管设备号（须隶属本站）")
+    effective_at: datetime = Field(description="带时区的生效时间，如 2026-10-02T08:00:00+08:00")
+    reason: str = Field(min_length=1, max_length=500, description="接管原因（必填）")
+
+    _tz = field_validator("effective_at")(_require_tz_aware)
+
+    @field_validator("device_no", "reason")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("不得为空白")
+        return v
+
+
 class ReadingIngest(BaseModel):
     device_no: str = Field(min_length=1, max_length=100)
     seq: int = Field(ge=0, description="设备内递增序号")
